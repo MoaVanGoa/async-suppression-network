@@ -1,0 +1,135 @@
+"""
+Asynchronous suppression network – chip-level simulation.
+Pure event-driven model, no biology, no global clock.
+
+Author: Moa van Goa
+Date: 2025-12-11
+"""
+#!/usr/bin/env python3
+"""
+Asynchronous suppression network – chip-level simulation.
+Pure event-driven model, no biology, no global clock.
+"""
+
+import asyncio, random, time
+from dataclasses import dataclass, field
+
+
+# ---------- scheduler ------------------------------------------------------ #
+class Ticker:
+    """Async ticker to track 'chip time' and sleep scaled durations."""
+    
+    def __init__(self, res_ms: float = 0.1):
+        self.res = res_ms  # time scaling
+        self.now = 0.0
+
+    async def sleep(self, dt: float):
+        """Sleep in scaled wall-clock time and advance ticker."""
+        await asyncio.sleep(dt * self.res / 1000)
+        self.now += dt
+
+
+# ---------- primitives ----------------------------------------------------- #
+@dataclass
+class Node:
+    """Event-driven node with threshold, decay, value, and outgoing links."""
+    idx: int
+    thr: float = 1.0
+    decay: float = 0.05
+    val: float = 0.0
+    links: list["Link"] = field(default_factory=list)
+    _last: float = 0.0
+    hist: list[tuple[float, float]] = field(default_factory=list)  # (time, value)
+
+    async def add(self, x: float, t: float, ticker: Ticker):
+        """Add input, apply decay, fire outgoing links if threshold exceeded."""
+        self.val *= (1 - self.decay) ** (t - self._last)
+        self._last = t
+        self.val += x
+        self.hist.append((t, self.val))
+        if self.val >= self.thr:
+            self.val = 0
+            await asyncio.gather(*(l.fire(t, ticker) for l in self.links))
+
+
+@dataclass
+class Link:
+    """Connection between nodes with weight and delay."""
+    src: Node
+    dst: Node
+    w: float
+    delay: float
+
+    async def fire(self, t: float, ticker: Ticker):
+        """Send event to destination after delay."""
+        await ticker.sleep(self.delay)
+        await self.dst.add(-self.w, t + self.delay, ticker)
+
+
+# ---------- network -------------------------------------------------------- #
+class Net:
+    """Chip-style asynchronous suppression network."""
+
+    def __init__(self, n_src: int, n_dst: int, p: float = 0.1):
+        self.src = [Node(i) for i in range(n_src)]
+        self.dst = [Node(i + n_src) for i in range(n_dst)]
+        # Random sparse connectivity
+        for s in self.src:
+            for d in self.dst:
+                if random.random() < p:
+                    s.links.append(
+                        Link(
+                            src=s,
+                            dst=d,
+                            w=random.uniform(0.3, 0.7),
+                            delay=random.uniform(0.5, 1.5),
+                        )
+                    )
+
+    async def run(self, dur: float = 100, rate: float = 30, res: float = 0.1):
+        """Run network asynchronously with Poisson-like event injection."""
+        tk = Ticker(res)
+
+        async def inject():
+            t = 0.0
+            while t < dur:
+                t += random.expovariate(rate / 1000)
+                if t < dur:
+                    node = random.choice(self.src)
+                    val = random.uniform(0.5, 1.5)
+                    asyncio.create_task(node.add(val, t, tk))
+
+        asyncio.create_task(inject())
+        await tk.sleep(dur)
+
+
+# ---------- demo ----------------------------------------------------------- #
+async def main():
+    random.seed(0)
+    net = Net(n_src=10, n_dst=50, p=0.15)
+    t0 = time.perf_counter()
+    await net.run(dur=200, rate=40, res=0.2)
+    elapsed = (time.perf_counter() - t0) * 1000
+    print(f"Simulation done in {elapsed:.2f} ms wall-clock time\n")
+
+    # Quick peek at source node history
+    for n in net.src[:3]:
+        print(f"src{n.idx} last 5 samples:", n.hist[-5:])
+
+    # Optional: visualize target node history
+    try:
+        import matplotlib.pyplot as plt
+        for n in net.dst[:5]:
+            t_vals, v_vals = zip(*n.hist)
+            plt.plot(t_vals, v_vals, label=f"dst{n.idx}")
+        plt.xlabel("Time")
+        plt.ylabel("Value")
+        plt.title("Sample Target Node Activity")
+        plt.legend()
+        plt.show()
+    except ImportError:
+        print("matplotlib not installed; skipping visualization.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
